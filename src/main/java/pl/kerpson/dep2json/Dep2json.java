@@ -56,15 +56,7 @@ public class Dep2json extends AbstractMojo {
     try {
       this.initializeIncludeDependencies();
 
-      List<DependencyInfo> allDependencies = getAllDependenciesFromAllModules();
-
-      List<DependencyInfo> filteredDependencies = new ArrayList<>();
-
-      for (DependencyInfo dependency : allDependencies) {
-        if (this.shouldIncludeDependency(dependency)) {
-          filteredDependencies.add(dependency);
-        }
-      }
+      List<DependencyInfo> filteredDependencies = this.getAllDependenciesWithTransitives();
 
       File outputDir = outputFile.getParentFile();
       if (!outputDir.exists()) {
@@ -78,23 +70,23 @@ public class Dep2json extends AbstractMojo {
     }
   }
 
-  private List<DependencyInfo> getAllDependenciesFromAllModules() throws DependencyGraphBuilderException {
-    List<DependencyInfo> allDependencies = new ArrayList<>();
+  private List<DependencyInfo> getAllDependenciesWithTransitives() throws DependencyGraphBuilderException {
+    List<DependencyInfo> result = new ArrayList<>();
     Set<String> processedArtifacts = new HashSet<>();
     MavenProject rootProject = session.getTopLevelProject();
 
-    this.processProjectDependencies(rootProject, allDependencies, processedArtifacts);
+    this.processProjectWithTransitives(rootProject, result, processedArtifacts);
 
     for (MavenProject module : rootProject.getCollectedProjects()) {
       if (!module.equals(rootProject)) {
-        this.processProjectDependencies(module, allDependencies, processedArtifacts);
+        this.processProjectWithTransitives(module, result, processedArtifacts);
       }
     }
 
-    return allDependencies;
+    return result;
   }
 
-  private void processProjectDependencies(
+  private void processProjectWithTransitives(
       MavenProject project,
       List<DependencyInfo> dependencies,
       Set<String> processedArtifacts
@@ -103,10 +95,20 @@ public class Dep2json extends AbstractMojo {
     buildingRequest.setProject(project);
 
     DependencyNode rootNode = dependencyGraphBuilder.buildDependencyGraph(buildingRequest, null);
-    this.collectDependencies(rootNode, dependencies, processedArtifacts);
+
+    for (DependencyNode child : rootNode.getChildren()) {
+      if (this.shouldIncludeDependency(child.getArtifact())) {
+        // Include this dependency and all its transitives
+        this.collectDependenciesRecursively(child, dependencies, processedArtifacts);
+      }
+    }
   }
 
-  private void collectDependencies(DependencyNode node, List<DependencyInfo> dependencies, Set<String> processedArtifacts) {
+  private void collectDependenciesRecursively(
+      DependencyNode node,
+      List<DependencyInfo> dependencies,
+      Set<String> processedArtifacts
+  ) {
     Artifact artifact = node.getArtifact();
     String artifactKey = artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getVersion();
 
@@ -119,10 +121,12 @@ public class Dep2json extends AbstractMojo {
 
       dependencies.add(dependencyInfo);
       processedArtifacts.add(artifactKey);
+
+      log.debug("Added dependency: " + artifactKey);
     }
 
     for (DependencyNode child : node.getChildren()) {
-      this.collectDependencies(child, dependencies, processedArtifacts);
+      this.collectDependenciesRecursively(child, dependencies, processedArtifacts);
     }
   }
 
@@ -141,8 +145,8 @@ public class Dep2json extends AbstractMojo {
     }
   }
 
-  private boolean shouldIncludeDependency(DependencyInfo dependency) {
-    String key = dependency.getGroupId() + ":" + dependency.getArtifactId();
+  private boolean shouldIncludeDependency(Artifact artifact) {
+    String key = artifact.getGroupId() + ":" + artifact.getArtifactId();
 
     if (this.includeDependenciesSet.isEmpty()) {
       return true;
@@ -156,6 +160,7 @@ public class Dep2json extends AbstractMojo {
     try (FileWriter writer = new FileWriter(outputFile)) {
       gson.toJson(dependencies, writer);
     }
+    log.info("Written " + dependencies.size() + " dependencies to " + outputFile.getAbsolutePath());
   }
 
   public static class DependencyInfo {
