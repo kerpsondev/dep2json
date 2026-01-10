@@ -47,7 +47,12 @@ public class Dep2json extends AbstractMojo {
   @Parameter(property = "includeDependencies")
   private String includeDependencies;
 
+  @Parameter(property = "excludeDependencies")
+  private String excludeDependencies;
+
   private Set<String> includeDependenciesSet;
+  private Set<String> excludeDependenciesSet;
+  private Set<String> matchedParents;
   private Log log;
 
   @Override
@@ -55,8 +60,10 @@ public class Dep2json extends AbstractMojo {
     this.log = getLog();
     try {
       this.initializeIncludeDependencies();
+      this.initializeExcludeDependencies();
+      this.matchedParents = new HashSet<>();
 
-      List<DependencyInfo> filteredDependencies = this.getAllDependenciesWithTransitives();
+      List<DependencyInfo> filteredDependencies = this.getDependencies();
 
       File outputDir = outputFile.getParentFile();
       if (!outputDir.exists()) {
@@ -70,23 +77,23 @@ public class Dep2json extends AbstractMojo {
     }
   }
 
-  private List<DependencyInfo> getAllDependenciesWithTransitives() throws DependencyGraphBuilderException {
+  private List<DependencyInfo> getDependencies() throws DependencyGraphBuilderException {
     List<DependencyInfo> result = new ArrayList<>();
     Set<String> processedArtifacts = new HashSet<>();
     MavenProject rootProject = session.getTopLevelProject();
 
-    this.processProjectWithTransitives(rootProject, result, processedArtifacts);
+    this.processProjectDependencies(rootProject, result, processedArtifacts);
 
     for (MavenProject module : rootProject.getCollectedProjects()) {
       if (!module.equals(rootProject)) {
-        this.processProjectWithTransitives(module, result, processedArtifacts);
+        this.processProjectDependencies(module, result, processedArtifacts);
       }
     }
 
     return result;
   }
 
-  private void processProjectWithTransitives(
+  private void processProjectDependencies(
       MavenProject project,
       List<DependencyInfo> dependencies,
       Set<String> processedArtifacts
@@ -97,22 +104,46 @@ public class Dep2json extends AbstractMojo {
     DependencyNode rootNode = dependencyGraphBuilder.buildDependencyGraph(buildingRequest, null);
 
     for (DependencyNode child : rootNode.getChildren()) {
-      if (this.shouldIncludeDependency(child.getArtifact())) {
-        // Include this dependency and all its transitives
-        this.collectDependenciesRecursively(child, dependencies, processedArtifacts);
+      Artifact artifact = child.getArtifact();
+      String key = artifact.getGroupId() + ":" + artifact.getArtifactId();
+
+      if (this.includeDependenciesSet.isEmpty() || includeDependenciesSet.contains(key)) {
+        matchedParents.add(key);
       }
+    }
+
+    for (DependencyNode child : rootNode.getChildren()) {
+      processNode(child, dependencies, processedArtifacts, false);
     }
   }
 
-  private void collectDependenciesRecursively(
+  private void processNode(
       DependencyNode node,
       List<DependencyInfo> dependencies,
-      Set<String> processedArtifacts
+      Set<String> processedArtifacts,
+      boolean isTransitive
   ) {
     Artifact artifact = node.getArtifact();
-    String artifactKey = artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getVersion();
+    String key = artifact.getGroupId() + ":" + artifact.getArtifactId();
+    String artifactKey = key + ":" + artifact.getVersion();
 
-    if (!processedArtifacts.contains(artifactKey)) {
+    if (excludeDependenciesSet.contains(key)) {
+      log.debug("Excluded dependency: " + key);
+      return;
+    }
+
+    boolean shouldAdd = false;
+
+    if (includeDependenciesSet.isEmpty()) {
+      shouldAdd = true;
+    } else if (matchedParents.contains(key)) {
+      shouldAdd = true;
+      isTransitive = false;
+    } else if (isTransitive) {
+      shouldAdd = true;
+    }
+
+    if (shouldAdd && !processedArtifacts.contains(artifactKey)) {
       DependencyInfo dependencyInfo = new DependencyInfo(
           artifact.getGroupId(),
           artifact.getArtifactId(),
@@ -122,11 +153,17 @@ public class Dep2json extends AbstractMojo {
       dependencies.add(dependencyInfo);
       processedArtifacts.add(artifactKey);
 
-      log.debug("Added dependency: " + artifactKey);
-    }
+      log.debug("Added dependency: " + artifactKey + (isTransitive ? " (transitive)" : ""));
 
-    for (DependencyNode child : node.getChildren()) {
-      this.collectDependenciesRecursively(child, dependencies, processedArtifacts);
+      if (node.getChildren() != null) {
+        for (DependencyNode child : node.getChildren()) {
+          processNode(child, dependencies, processedArtifacts, true);
+        }
+      }
+    } else if (matchedParents.contains(key) && node.getChildren() != null) {
+      for (DependencyNode child : node.getChildren()) {
+        processNode(child, dependencies, processedArtifacts, true);
+      }
     }
   }
 
@@ -145,14 +182,19 @@ public class Dep2json extends AbstractMojo {
     }
   }
 
-  private boolean shouldIncludeDependency(Artifact artifact) {
-    String key = artifact.getGroupId() + ":" + artifact.getArtifactId();
+  private void initializeExcludeDependencies() {
+    excludeDependenciesSet = new HashSet<>();
 
-    if (this.includeDependenciesSet.isEmpty()) {
-      return true;
+    if (excludeDependencies != null && !excludeDependencies.trim().isEmpty()) {
+      String cleaned = excludeDependencies.replaceAll("\\s+", "").replaceAll("\n", "");
+      String[] deps = cleaned.split(",");
+      for (String dep : deps) {
+        String trimmed = dep.trim();
+        if (!trimmed.isEmpty()) {
+          excludeDependenciesSet.add(trimmed);
+        }
+      }
     }
-
-    return includeDependenciesSet.contains(key);
   }
 
   private void writeDependenciesToJson(List<DependencyInfo> dependencies) throws IOException {
@@ -160,6 +202,7 @@ public class Dep2json extends AbstractMojo {
     try (FileWriter writer = new FileWriter(outputFile)) {
       gson.toJson(dependencies, writer);
     }
+
     log.info("Written " + dependencies.size() + " dependencies to " + outputFile.getAbsolutePath());
   }
 
